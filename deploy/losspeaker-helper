@@ -1,0 +1,157 @@
+#!/usr/bin/python3
+"""Restricted root helper. Never executes user-controlled shell commands."""
+
+import json, os, re, subprocess, sys
+from pathlib import Path
+
+ROOT = Path("/srv/losspeaker/music")
+
+
+def call(*args):
+    return subprocess.run(
+        args, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def user_service(action, unit):
+    uid = call("id", "-u", "losspeaker")
+    call(
+        "runuser",
+        "-u",
+        "losspeaker",
+        "--",
+        "env",
+        "XDG_RUNTIME_DIR=/run/user/" + uid,
+        "systemctl",
+        "--user",
+        action,
+        unit,
+    )
+
+
+def mount_definition(name, kind, what, target, fstype, opts):
+    # Local mounts are ordered before local-fs.target by systemd. Waiting for
+    # networking here creates a cycle through D-Bus and NetworkManager at boot.
+    network = (
+        "After=network-online.target\nWants=network-online.target\n"
+        if kind in ("smb", "nfs")
+        else ""
+    )
+    return (
+        f"[Unit]\nDescription=LosSpeaker music {name}\n{network}"
+        f"[Mount]\nWhat={what}\nWhere={target}\nType={fstype}\nOptions={opts}\nTimeoutSec=15\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    )
+
+
+def main():
+    if os.geteuid() != 0:
+        raise ValueError("Root required")
+    if sys.argv[1:] and sys.argv[1] == "output":
+        if (
+            len(sys.argv) != 4
+            or not re.fullmatch(r"hw:CARD=[\w-]+,DEV=\d+", sys.argv[2])
+            or sys.argv[3] not in ("yes", "no")
+        ):
+            raise ValueError("Invalid output")
+        path = Path("/etc/losspeaker/mpd.conf")
+        text = path.read_text()
+        text = re.sub(
+            r'device "hw:CARD=[\w-]+,DEV=\d+"', 'device "' + sys.argv[2] + '"', text
+        )
+        text = re.sub(r'dop "(?:yes|no)"', 'dop "' + sys.argv[3] + '"', text)
+        path.write_text(text)
+        user_service("restart", "losspeaker-mpd")
+        return
+    if sys.argv[1:] != ["mount"]:
+        raise ValueError("Unknown action")
+    d = json.loads(sys.stdin.read(8192))
+    name = d["name"]
+    kind = d["kind"]
+    remote = d["remote"]
+    if not re.fullmatch("[a-zA-Z0-9_-]{1,40}", name) or kind not in (
+        "local",
+        "usb",
+        "smb",
+        "nfs",
+    ):
+        raise ValueError("Invalid source")
+    if any(x in remote for x in ["\n", "\r", "\x00", "%", " ", "\t"]):
+        raise ValueError("Invalid remote path")
+    target = ROOT / name
+    if target.is_symlink():
+        raise ValueError("Symlink mount target forbidden")
+    target.mkdir(parents=True, exist_ok=True)
+    if target.resolve().parent != ROOT.resolve():
+        raise ValueError("Invalid target")
+    uid = call("id", "-u", "losspeaker")
+    gid = call("id", "-g", "losspeaker")
+    if kind == "local":
+        source = Path(remote).resolve()
+        if not source.is_relative_to("/srv/losspeaker/local") or not source.is_dir():
+            raise ValueError("Local path must exist inside /srv/losspeaker/local")
+        what = str(source)
+        fstype = "none"
+        opts = "bind,ro"
+    elif kind == "usb":
+        if not re.fullmatch("[0-9A-Fa-f-]{4,64}", remote):
+            raise ValueError("Expected filesystem UUID")
+        what = "/dev/disk/by-uuid/" + remote
+        fstype = "auto"
+        opts = "ro,nosuid,nodev,noexec"
+    elif kind == "smb":
+        if not re.fullmatch(r"//[\w.-]+/[\w./-]+", remote):
+            raise ValueError("Expected //server/share")
+        secret = Path("/etc/losspeaker/credentials") / name
+        secret.parent.mkdir(mode=0o700, exist_ok=True)
+        for k in ("username", "password"):
+            if any(x in d.get(k, "") for x in ["\n", "\r", "\x00"]):
+                raise ValueError("Invalid credentials")
+        fd = os.open(
+            secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(
+                "username="
+                + d.get("username", "")
+                + "\npassword="
+                + d.get("password", "")
+                + "\n"
+            )
+        what = remote
+        fstype = "cifs"
+        opts = (
+            f"ro,nosuid,nodev,noexec,vers=3.0,uid={uid},gid={gid},credentials={secret}"
+        )
+    else:
+        if not re.fullmatch(r"[\w.-]+:/[\w./-]+", remote):
+            raise ValueError("Expected server:/export")
+        what = remote
+        fstype = "nfs"
+        opts = "ro,nosuid,nodev,noexec,soft,timeo=30,retrans=2"
+    unit = call("systemd-escape", "--path", "--suffix=mount", str(target))
+    unit_file = Path("/etc/systemd/system", unit)
+    previous = unit_file.read_text() if unit_file.exists() else None
+    unit_file.write_text(mount_definition(name, kind, what, target, fstype, opts))
+    check = subprocess.run(
+        ["systemd-analyze", "verify", str(unit_file)], capture_output=True, text=True
+    )
+    if check.returncode or "Found ordering cycle:" in check.stderr:
+        if previous is None:
+            unit_file.unlink()
+        else:
+            unit_file.write_text(previous)
+        raise ValueError(
+            "Mount failed boot dependency validation: " + check.stderr[-1500:]
+        )
+    call("systemctl", "daemon-reload")
+    call("systemctl", "enable", unit)
+    call("systemctl", "start", unit)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

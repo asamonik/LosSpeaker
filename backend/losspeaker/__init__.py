@@ -1,0 +1,1 @@
+"""LosSpeaker audio appliance."""
